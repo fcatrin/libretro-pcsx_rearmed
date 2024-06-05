@@ -149,7 +149,13 @@
 #define gteBFC (((s32 *)regs->CP2C.r)[23])
 #define gteOFX (((s32 *)regs->CP2C.r)[24])
 #define gteOFY (((s32 *)regs->CP2C.r)[25])
-#define gteH   (regs->CP2C.p[26].sw.l)
+// senquack - gteH register is u16, not s16, and used in GTE that way.
+//  HOWEVER when read back by CPU using CFC2, it will be incorrectly
+//  sign-extended by bug in original hardware, according to Nocash docs
+//  GTE section 'Screen Offset and Distance'. The emulator does this
+//  sign extension when it is loaded to GTE by CTC2.
+//#define gteH   (regs->CP2C.p[26].sw.l)
+#define gteH   (regs->CP2C.p[26].w.l)
 #define gteDQA (regs->CP2C.p[27].sw.l)
 #define gteDQB (((s32 *)regs->CP2C.r)[28])
 #define gteZSF3 (regs->CP2C.p[29].sw.l)
@@ -254,12 +260,48 @@ static inline u32 limE_(psxCP2Regs *regs, u32 result) {
 #define A3U(x) (x)
 #endif
 
+
+//senquack - n param should be unsigned (will be 'gteH' reg which is u16)
+#ifdef GTE_USE_NATIVE_DIVIDE
+INLINE u32 DIVIDE(u16 n, u16 d) {
+	if (n < d * 2) {
+		return ((u32)n << 16) / d;
+	}
+	return 0xffffffff;
+}
+#else
 #include "gte_divider.h"
+#endif // GTE_USE_NATIVE_DIVIDE
 
 #ifndef FLAGLESS
 
-u32 MFC2(int reg) {
-	psxCP2Regs *regs = &psxRegs.CP2;
+const unsigned char gte_cycletab[64] = {
+	/*   1   2   3   4   5   6   7   8   9   a   b   c   d   e   f */
+	 0, 15,  0,  0,  0,  0,  8,  0,  0,  0,  0,  0,  6,  0,  0,  0,
+	 8,  8,  8, 19, 13,  0, 44,  0,  0,  0,  0, 17, 11,  0, 14,  0,
+	30,  0,  0,  0,  0,  0,  0,  0,  5,  8, 17,  0,  0,  5,  6,  0,
+	23,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  5,  5, 39,
+};
+
+// warning: called by the dynarec
+int gteCheckStallRaw(u32 op_cycles, psxRegisters *regs) {
+	u32 left = regs->gteBusyCycle - regs->cycle;
+	int stall = 0;
+
+	if (left <= 44) {
+		//printf("c %2u stall %2u %u\n", op_cycles, left, regs->cycle);
+		regs->cycle = regs->gteBusyCycle;
+		stall = left;
+	}
+	regs->gteBusyCycle = regs->cycle + op_cycles;
+	return stall;
+}
+
+void gteCheckStall(u32 op) {
+	gteCheckStallRaw(gte_cycletab[op], &psxRegs);
+}
+
+u32 MFC2(struct psxCP2Regs *regs, int reg) {
 	switch (reg) {
 		case 1:
 		case 3:
@@ -268,7 +310,7 @@ u32 MFC2(int reg) {
 		case 9:
 		case 10:
 		case 11:
-			psxRegs.CP2D.r[reg] = (s32)psxRegs.CP2D.p[reg].sw.l;
+			regs->CP2D.r[reg] = (s32)regs->CP2D.p[reg].sw.l;
 			break;
 
 		case 7:
@@ -276,25 +318,24 @@ u32 MFC2(int reg) {
 		case 17:
 		case 18:
 		case 19:
-			psxRegs.CP2D.r[reg] = (u32)psxRegs.CP2D.p[reg].w.l;
+			regs->CP2D.r[reg] = (u32)regs->CP2D.p[reg].w.l;
 			break;
 
 		case 15:
-			psxRegs.CP2D.r[reg] = gteSXY2;
+			regs->CP2D.r[reg] = gteSXY2;
 			break;
 
 		case 28:
 		case 29:
-			psxRegs.CP2D.r[reg] = LIM(gteIR1 >> 7, 0x1f, 0, 0) |
+			regs->CP2D.r[reg] = LIM(gteIR1 >> 7, 0x1f, 0, 0) |
 									(LIM(gteIR2 >> 7, 0x1f, 0, 0) << 5) |
 									(LIM(gteIR3 >> 7, 0x1f, 0, 0) << 10);
 			break;
 	}
-	return psxRegs.CP2D.r[reg];
+	return regs->CP2D.r[reg];
 }
 
-void MTC2(u32 value, int reg) {
-	psxCP2Regs *regs = &psxRegs.CP2;
+void MTC2(struct psxCP2Regs *regs, u32 value, int reg) {
 	switch (reg) {
 		case 15:
 			gteSXY0 = gteSXY1;
@@ -305,9 +346,10 @@ void MTC2(u32 value, int reg) {
 
 		case 28:
 			gteIRGB = value;
-			gteIR1 = (value & 0x1f) << 7;
-			gteIR2 = (value & 0x3e0) << 2;
-			gteIR3 = (value & 0x7c00) >> 3;
+			// not gteIR1 etc. just to be consistent with dynarec
+			regs->CP2D.n.ir1 = (value & 0x1f) << 7;
+			regs->CP2D.n.ir2 = (value & 0x3e0) << 2;
+			regs->CP2D.n.ir3 = (value & 0x7c00) >> 3;
 			break;
 
 		case 30:
@@ -335,11 +377,11 @@ void MTC2(u32 value, int reg) {
 			return;
 
 		default:
-			psxRegs.CP2D.r[reg] = value;
+			regs->CP2D.r[reg] = value;
 	}
 }
 
-void CTC2(u32 value, int reg) {
+void CTC2(struct psxCP2Regs *regs, u32 value, int reg) {
 	switch (reg) {
 		case 4:
 		case 12:
@@ -357,35 +399,7 @@ void CTC2(u32 value, int reg) {
 			break;
 	}
 
-	psxRegs.CP2C.r[reg] = value;
-}
-
-void gteMFC2() {
-	if (!_Rt_) return;
-	psxRegs.GPR.r[_Rt_] = MFC2(_Rd_);
-}
-
-void gteCFC2() {
-	if (!_Rt_) return;
-	psxRegs.GPR.r[_Rt_] = psxRegs.CP2C.r[_Rd_];
-}
-
-void gteMTC2() {
-	MTC2(psxRegs.GPR.r[_Rt_], _Rd_);
-}
-
-void gteCTC2() {
-	CTC2(psxRegs.GPR.r[_Rt_], _Rd_);
-}
-
-#define _oB_ (psxRegs.GPR.r[_Rs_] + _Imm_)
-
-void gteLWC2() {
-	MTC2(psxMemRead32(_oB_), _Rt_);
-}
-
-void gteSWC2() {
-	psxMemWrite32(_oB_, MFC2(_Rt_));
+	regs->CP2C.r[reg] = value;
 }
 
 #endif // FLAGLESS

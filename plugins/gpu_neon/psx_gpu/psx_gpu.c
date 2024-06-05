@@ -14,9 +14,24 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stddef.h>
 #include <string.h>
+#include <assert.h>
 
 #include "common.h"
+#ifndef NEON_BUILD
+#include "vector_ops.h"
+#endif
+#include "psx_gpu_simd.h"
+#include "psx_gpu_offsets.h"
+
+#if 0
+void dump_r_d(const char *name, void *dump);
+void dump_r_q(const char *name, void *dump);
+#define dumprd(n) dump_r_d(#n, n.e)
+#define dumprq(n) dump_r_q(#n, n.e)
+#endif
 
 u32 span_pixels = 0;
 u32 span_pixel_blocks = 0;
@@ -46,6 +61,8 @@ u32 clipped_triangles = 0;
 u32 zero_block_spans = 0;
 u32 texture_cache_loads = 0;
 u32 false_modulated_blocks = 0;
+
+#define stats_add(stat, count) // stat += count
 
 /* double size for enhancement */
 u32 reciprocal_table[512 * 2];
@@ -245,8 +262,8 @@ u32 invalidate_texture_cache_region_viewport(psx_gpu_struct *psx_gpu, u32 x1,
   return mask;
 }
 
-void update_texture_cache_region(psx_gpu_struct *psx_gpu, u32 x1, u32 y1,
- u32 x2, u32 y2)
+static void update_texture_cache_region_(psx_gpu_struct *psx_gpu,
+ u32 x1, u32 y1, u32 x2, u32 y2)
 {
   u32 mask = texture_region_mask(x1, y1, x2, y2);
   u32 texture_page;
@@ -298,8 +315,21 @@ void update_texture_cache_region(psx_gpu_struct *psx_gpu, u32 x1, u32 y1,
   }
 }
 
-void update_texture_8bpp_cache_slice(psx_gpu_struct *psx_gpu,
- u32 texture_page);
+void update_texture_cache_region(psx_gpu_struct *psx_gpu, u32 x1, u32 y1,
+ u32 x2, u32 y2)
+{
+  s32 w = x2 - x1;
+  do
+  {
+    x2 = x1 + w;
+    if (x2 > 1023)
+      x2 = 1023;
+    update_texture_cache_region_(psx_gpu, x1, y1, x2, y2);
+    w -= x2 - x1;
+    x1 = 0;
+  }
+  while (unlikely(w > 0));
+}
 
 #ifndef NEON_BUILD
 
@@ -449,9 +479,6 @@ void update_texture_8bpp_cache(psx_gpu_struct *psx_gpu)
   }
 }
 
-void setup_blocks_shaded_untextured_undithered_unswizzled_indirect(
- psx_gpu_struct *psx_gpu);
-
 void flush_render_block_buffer(psx_gpu_struct *psx_gpu)
 {
   if((psx_gpu->render_mode & RENDER_INTERLACE_ENABLED) &&
@@ -514,9 +541,6 @@ void flush_render_block_buffer(psx_gpu_struct *psx_gpu)
   }
 }
 
-
-void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
- vertex_struct *b, vertex_struct *c);
 
 #ifndef NEON_BUILD
 
@@ -767,31 +791,30 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
     printf("mismatch on %s %s: %x vs %x\n", #_a, #_b, _a, _b)                  \
 
 
-#ifndef NDEBUG
-#define setup_spans_debug_check(span_edge_data_element)                        \
-{                                                                              \
-  u32 _num_spans = &span_edge_data_element - psx_gpu->span_edge_data;          \
-  if (_num_spans > MAX_SPANS)                                                  \
-    *(int *)0 = 1;                                                             \
-  if (_num_spans < psx_gpu->num_spans)                                         \
-  {                                                                            \
-    if(span_edge_data_element.num_blocks > MAX_BLOCKS_PER_ROW)                 \
-      *(int *)0 = 1;                                                           \
-    if(span_edge_data_element.y > 2048)                                        \
-      *(int *)0 = 1;                                                           \
-  }                                                                            \
-}                                                                              \
-
+#if !defined(NEON_BUILD) && !defined(NDEBUG)
+static void setup_spans_debug_check(psx_gpu_struct *psx_gpu,
+  edge_data_struct *span_edge_data_element)
+{
+  u32 _num_spans = span_edge_data_element - psx_gpu->span_edge_data;
+  if (_num_spans > MAX_SPANS)
+    *(volatile int *)0 = 1;
+  if (_num_spans < psx_gpu->num_spans)
+  {
+    if(span_edge_data_element->num_blocks > MAX_BLOCKS_PER_ROW)
+      *(volatile int *)0 = 2;
+    if(span_edge_data_element->y >= 2048)
+      *(volatile int *)0 = 3;
+  }
+}
 #else
-#define setup_spans_debug_check(span_edge_data_element)                        \
-
+#define setup_spans_debug_check(psx_gpu, span_edge_data_element)
 #endif
 
 #define setup_spans_prologue_alternate_yes()                                   \
   vec_2x64s alternate_x;                                                       \
   vec_2x64s alternate_dx_dy;                                                   \
   vec_4x32s alternate_x_32;                                                    \
-  vec_2x32s alternate_x_16;                                                    \
+  vec_4x16u alternate_x_16;                                                    \
                                                                                \
   vec_4x16u alternate_select;                                                  \
   vec_4x16s y_mid_point;                                                       \
@@ -851,6 +874,7 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
   span_b_offset = psx_gpu->span_b_offset;                                      \
                                                                                \
   vec_8x16u c_0x0001;                                                          \
+  vec_4x16u c_max_blocks_per_row;                                              \
                                                                                \
   dup_8x16b(c_0x0001, 0x0001);                                                 \
   dup_8x16b(left_edge, psx_gpu->viewport_start_x);                             \
@@ -859,6 +883,7 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
   dup_4x16b(c_0x04, 0x04);                                                     \
   dup_4x16b(c_0x07, 0x07);                                                     \
   dup_4x16b(c_0xFFFE, 0xFFFE);                                                 \
+  dup_4x16b(c_max_blocks_per_row, MAX_BLOCKS_PER_ROW);                         \
 
 
 #define compute_edge_delta_x2()                                                \
@@ -1082,6 +1107,7 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
   and_4x16b(span_shift, left_right_x_16.high, c_0x07);                         \
   shl_variable_4x16b(span_shift, c_0xFFFE, span_shift);                        \
   shr_4x16b(left_right_x_16.high, left_right_x_16.high, 3);                    \
+  min_4x16b(left_right_x_16.high, left_right_x_16.high, c_max_blocks_per_row); \
                                                                                \
   u32 i;                                                                       \
   for(i = 0; i < 4; i++)                                                       \
@@ -1090,7 +1116,7 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
     span_edge_data[i].num_blocks = left_right_x_16.high.e[i];                  \
     span_edge_data[i].right_mask = span_shift.e[i];                            \
     span_edge_data[i].y = y_x4.e[i];                                           \
-    setup_spans_debug_check(span_edge_data[i]);                                \
+    setup_spans_debug_check(psx_gpu, &span_edge_data[i]);                      \
   }                                                                            \
                                                                                \
   span_edge_data += 4;                                                         \
@@ -1120,7 +1146,9 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
                                                                                \
   setup_spans_prologue_b();                                                    \
                                                                                \
-  if(height > 0)                                                               \
+  if (height > 512)                                                            \
+    height = 512;                                                              \
+  if (height > 0)                                                              \
   {                                                                            \
     y_x4.e[0] = y_a;                                                           \
     y_x4.e[1] = y_a + 1;                                                       \
@@ -1168,7 +1196,9 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
                                                                                \
   setup_spans_prologue_b();                                                    \
                                                                                \
-  if(height > 0)                                                               \
+  if (height > 512)                                                            \
+    height = 512;                                                              \
+  if (height > 0)                                                              \
   {                                                                            \
     y_x4.e[0] = y_a;                                                           \
     y_x4.e[1] = y_a - 1;                                                       \
@@ -1203,26 +1233,6 @@ void compute_all_gradients(psx_gpu_struct *psx_gpu, vertex_struct *a,
                                                                                \
   compute_edge_delta_x3(x_b, height, height_minor_a);                          \
   setup_spans_up(index_##major, index_##minor, minor, yes)                     \
-
-
-void setup_spans_up_left(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_up_right(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_down_left(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_down_right(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_up_a(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_up_b(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_down_a(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_down_b(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
-void setup_spans_up_down(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
- vertex_struct *v_b, vertex_struct *v_c);
 
 
 #ifndef NEON_BUILD
@@ -1378,7 +1388,9 @@ void setup_spans_up_down(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
 
   setup_spans_prologue_b();
 
-  if(height_minor_a > 0)
+  if (height_minor_a > 512)
+    height_minor_a = 512;
+  if (height_minor_a > 0)
   {
     y_x4.e[0] = y_a;
     y_x4.e[1] = y_a - 1;
@@ -1420,7 +1432,9 @@ void setup_spans_up_down(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
     setup_spans_clip(increment, no);
   }
 
-  if(height_minor_b > 0)
+  if (height_minor_b > 512)
+    height_minor_b = 512;
+  if (height_minor_b > 0)
   {
     y_x4.e[0] = y_a;
     y_x4.e[1] = y_a + 1;
@@ -1867,7 +1881,7 @@ void setup_spans_up_down(psx_gpu_struct *psx_gpu, vertex_struct *v_a,
   }                                                                            \
 
 #define setup_blocks_add_blocks_direct()                                       \
-  texel_blocks_untextured += span_num_blocks;                                  \
+  stats_add(texel_blocks_untextured, span_num_blocks);                         \
   span_pixel_blocks += span_num_blocks                                         \
 
 
@@ -1941,30 +1955,6 @@ void setup_blocks_##shading##_##texturing##_##dithering##_##sw##_##target(     \
   psx_gpu->num_blocks = num_blocks;                                            \
 }                                                                              \
 
-void setup_blocks_shaded_textured_dithered_unswizzled_indirect(psx_gpu_struct
- *psx_gpu);
-
-void setup_blocks_shaded_untextured_dithered_unswizzled_indirect(psx_gpu_struct
- *psx_gpu);
-void setup_blocks_shaded_untextured_undithered_unswizzled_indirect(
- psx_gpu_struct *psx_gpu);
-void setup_blocks_shaded_untextured_dithered_unswizzled_direct(psx_gpu_struct
- *psx_gpu);
-void setup_blocks_shaded_untextured_undithered_unswizzled_direct(
- psx_gpu_struct *psx_gpu);
-
-void setup_blocks_unshaded_textured_dithered_unswizzled_indirect(psx_gpu_struct
- *psx_gpu);
-void setup_blocks_unshaded_untextured_undithered_unswizzled_indirect(
- psx_gpu_struct *psx_gpu);
-void setup_blocks_unshaded_untextured_undithered_unswizzled_direct(
- psx_gpu_struct *psx_gpu);
-
-void setup_blocks_shaded_textured_dithered_swizzled_indirect(psx_gpu_struct
- *psx_gpu);
-void setup_blocks_unshaded_textured_dithered_swizzled_indirect(psx_gpu_struct
- *psx_gpu);
-
 
 //setup_blocks_builder(unshaded, untextured, undithered, unswizzled, direct);
 
@@ -1984,26 +1974,17 @@ setup_blocks_builder(shaded, untextured, dithered, unswizzled, direct);
 setup_blocks_builder(unshaded, untextured, undithered, unswizzled, indirect);
 setup_blocks_builder(unshaded, untextured, undithered, unswizzled, direct);
 
-#endif
-
-void texture_blocks_untextured(psx_gpu_struct *psx_gpu);
-void texture_blocks_4bpp(psx_gpu_struct *psx_gpu);
-void texture_blocks_8bpp(psx_gpu_struct *psx_gpu);
-void texture_blocks_16bpp(psx_gpu_struct *psx_gpu);
-
-#ifndef NEON_BUILD
-
 void texture_blocks_untextured(psx_gpu_struct *psx_gpu)
 {
   if(psx_gpu->primitive_type != PRIMITIVE_TYPE_SPRITE)
-    texel_blocks_untextured += psx_gpu->num_blocks;
+    stats_add(texel_blocks_untextured, psx_gpu->num_blocks);
 }
 
 void texture_blocks_4bpp(psx_gpu_struct *psx_gpu)
 {
   block_struct *block = psx_gpu->blocks;
   u32 num_blocks = psx_gpu->num_blocks;
-  texel_blocks_4bpp += num_blocks;
+  stats_add(texel_blocks_4bpp, num_blocks);
 
   vec_8x8u texels_low;
   vec_8x8u texels_high;
@@ -2055,7 +2036,7 @@ void texture_blocks_8bpp(psx_gpu_struct *psx_gpu)
   block_struct *block = psx_gpu->blocks;
   u32 num_blocks = psx_gpu->num_blocks;
 
-  texel_blocks_8bpp += num_blocks;
+  stats_add(texel_blocks_8bpp, num_blocks);
 
   if(psx_gpu->current_texture_mask & psx_gpu->dirty_textures_8bpp_mask)
     update_texture_8bpp_cache(psx_gpu);
@@ -2089,7 +2070,7 @@ void texture_blocks_16bpp(psx_gpu_struct *psx_gpu)
   block_struct *block = psx_gpu->blocks;
   u32 num_blocks = psx_gpu->num_blocks;
 
-  texel_blocks_16bpp += num_blocks;
+  stats_add(texel_blocks_16bpp, num_blocks);
 
   vec_8x16u texels;
 
@@ -2277,27 +2258,6 @@ void shade_blocks_##shading##_textured_modulated_##dithering##_##target(       \
   }                                                                            \
 }                                                                              \
 
-void shade_blocks_shaded_textured_modulated_dithered_direct(psx_gpu_struct
- *psx_gpu);
-void shade_blocks_shaded_textured_modulated_undithered_direct(psx_gpu_struct
- *psx_gpu);
-void shade_blocks_unshaded_textured_modulated_dithered_direct(psx_gpu_struct
- *psx_gpu);
-void shade_blocks_unshaded_textured_modulated_undithered_direct(psx_gpu_struct
- *psx_gpu);
-
-void shade_blocks_shaded_textured_modulated_dithered_indirect(psx_gpu_struct
- *psx_gpu);
-void shade_blocks_shaded_textured_modulated_undithered_indirect(psx_gpu_struct
- *psx_gpu);
-void shade_blocks_unshaded_textured_modulated_dithered_indirect(psx_gpu_struct
- *psx_gpu);
-void shade_blocks_unshaded_textured_modulated_undithered_indirect(psx_gpu_struct
- *psx_gpu);
-
-void shade_blocks_textured_unmodulated_indirect(psx_gpu_struct *psx_gpu);
-void shade_blocks_textured_unmodulated_direct(psx_gpu_struct *psx_gpu);
-
 #ifndef NEON_BUILD
 
 shade_blocks_textured_modulated_builder(shaded, dithered, direct);
@@ -2383,14 +2343,6 @@ void shade_blocks_textured_unmodulated_dithered_##target(psx_gpu_struct        \
 shade_blocks_textured_unmodulated_builder(indirect)
 shade_blocks_textured_unmodulated_builder(direct)
 
-#endif
-
-
-void shade_blocks_unshaded_untextured_indirect(psx_gpu_struct *psx_gpu);
-void shade_blocks_unshaded_untextured_direct(psx_gpu_struct *psx_gpu);
-
-#ifndef NEON_BUILD
-                                                                               
 void shade_blocks_unshaded_untextured_indirect(psx_gpu_struct *psx_gpu)
 {
 }
@@ -2601,27 +2553,6 @@ void                                                                           \
     block++;                                                                   \
   }                                                                            \
 }                                                                              \
-
-void blend_blocks_textured_average_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_average_on(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_add_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_add_on(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_subtract_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_subtract_on(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_add_fourth_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_add_fourth_on(psx_gpu_struct *psx_gpu);
-
-void blend_blocks_untextured_average_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_untextured_average_on(psx_gpu_struct *psx_gpu);
-void blend_blocks_untextured_add_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_untextured_add_on(psx_gpu_struct *psx_gpu);
-void blend_blocks_untextured_subtract_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_untextured_subtract_on(psx_gpu_struct *psx_gpu);
-void blend_blocks_untextured_add_fourth_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_untextured_add_fourth_on(psx_gpu_struct *psx_gpu);
-
-void blend_blocks_textured_unblended_off(psx_gpu_struct *psx_gpu);
-void blend_blocks_textured_unblended_on(psx_gpu_struct *psx_gpu);
 
 #ifndef NEON_BUILD
 
@@ -2885,7 +2816,7 @@ blend_blocks_builder(textured, unblended, on);
   render_blocks_switch_block_texture_mode(4bpp),                               \
   render_blocks_switch_block_texture_mode(8bpp),                               \
   render_blocks_switch_block_texture_mode(16bpp),                              \
-  render_blocks_switch_block_texture_mode(4bpp)                                \
+  render_blocks_switch_block_texture_mode(16bpp)                               \
 
 
 render_block_handler_struct render_triangle_block_handlers[] =
@@ -3143,6 +3074,7 @@ static void render_triangle_p(psx_gpu_struct *psx_gpu,
       }
     }
   }
+  assert(psx_gpu->span_edge_data[0].y < 1024u);
 
   u32 render_state = flags &
    (RENDER_FLAGS_MODULATE_TEXELS | RENDER_FLAGS_BLEND | 
@@ -3175,10 +3107,7 @@ void render_triangle(psx_gpu_struct *psx_gpu, vertex_struct *vertexes,
     render_triangle_p(psx_gpu, vertex_ptrs, flags);
 }
 
-
-void texture_sprite_blocks_8bpp(psx_gpu_struct *psx_gpu);
-
-#ifndef NEON_BUILD
+#if !defined(NEON_BUILD) || defined(SIMD_BUILD)
 
 void texture_sprite_blocks_8bpp(psx_gpu_struct *psx_gpu)
 {
@@ -3231,7 +3160,7 @@ void texture_sprite_blocks_8bpp(psx_gpu_struct *psx_gpu)
 
 
 #define setup_sprite_tile_fetch_texel_block_8bpp(offset)                       \
-  texture_block_ptr = psx_gpu->texture_page_ptr +                              \
+  texture_block_ptr = (u8 *)psx_gpu->texture_page_ptr +                        \
    ((texture_offset + offset) & texture_mask);                                 \
                                                                                \
   load_64b(texels, texture_block_ptr)                                          \
@@ -3339,7 +3268,7 @@ void texture_sprite_blocks_8bpp(psx_gpu_struct *psx_gpu)
 
 #define setup_sprite_tile_half_8bpp(edge)                                      \
 {                                                                              \
-  setup_sprite_tile_add_blocks(sub_tile_height * 2);                           \
+  setup_sprite_tile_add_blocks(sub_tile_height);                               \
                                                                                \
   while(sub_tile_height)                                                       \
   {                                                                            \
@@ -3793,7 +3722,7 @@ void setup_sprite_##texture_mode##x4mode(psx_gpu_struct *psx_gpu, s32 x, s32 y,\
   u32 num_blocks = psx_gpu->num_blocks;                                        \
   block_struct *block = psx_gpu->blocks + num_blocks;                          \
                                                                                \
-  u16 *texture_block_ptr;                                                      \
+  u8 *texture_block_ptr;                                                       \
   vec_8x8u texels;                                                             \
                                                                                \
   setup_sprite_tiled_initialize_##texture_mode##x4mode();                      \
@@ -3880,31 +3809,15 @@ void setup_sprite_##texture_mode##x4mode(psx_gpu_struct *psx_gpu, s32 x, s32 y,\
   }                                                                            \
 }                                                                              \
 
-void setup_sprite_4bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u, s32 v,
- s32 width, s32 height, u32 color);
-void setup_sprite_8bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u, s32 v,
- s32 width, s32 height, u32 color);
-void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u, s32 v,
- s32 width, s32 height, u32 color);
-
-void setup_sprite_4bpp_4x(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u, s32 v,
- s32 width, s32 height, u32 color);
-void setup_sprite_8bpp_4x(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u, s32 v,
- s32 width, s32 height, u32 color);
-void setup_sprite_16bpp_4x(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u, s32 v,
- s32 width, s32 height, u32 color);
-
-void setup_sprite_untextured(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
- s32 v, s32 width, s32 height, u32 color);
-void setup_sprite_untextured_simple(psx_gpu_struct *psx_gpu, s32 x, s32 y,
- s32 u, s32 v, s32 width, s32 height, u32 color);
-
 #ifndef NEON_BUILD
 setup_sprite_tiled_builder(4bpp,);
 setup_sprite_tiled_builder(8bpp,);
 
 setup_sprite_tiled_builder(4bpp,_4x);
 setup_sprite_tiled_builder(8bpp,_4x);
+#endif
+
+#if !defined(NEON_BUILD) || defined(SIMD_BUILD)
 
 void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
  s32 v, s32 width, s32 height, u32 color)
@@ -3933,7 +3846,7 @@ void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
 
   texture_offset_base &= ~0x7;
 
-  sprites_16bpp++;
+  stats_add(sprites_16bpp, 1);
 
   if(block_width == 1)
   {
@@ -3954,7 +3867,7 @@ void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
       texture_block_ptr =
        texture_page_ptr + (texture_offset_base & texture_mask);
 
-      load_128b(block->texels, texture_block_ptr);
+      block->texels = *(vec_8x16u *)texture_block_ptr;
       block->draw_mask_bits = mask_bits;
       block->fb_ptr = fb_ptr;
 
@@ -3988,7 +3901,7 @@ void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
       texture_offset_base += 1024;
 
       texture_block_ptr = texture_page_ptr + (texture_offset & texture_mask);
-      load_128b(block->texels, texture_block_ptr);
+      block->texels = *(vec_8x16u *)texture_block_ptr;
 
       block->draw_mask_bits = left_mask_bits;
       block->fb_ptr = fb_ptr;
@@ -4000,7 +3913,7 @@ void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
       while(blocks_remaining)
       {
         texture_block_ptr = texture_page_ptr + (texture_offset & texture_mask);
-        load_128b(block->texels, texture_block_ptr);
+        block->texels = *(vec_8x16u *)texture_block_ptr;
 
         block->draw_mask_bits = 0;
         block->fb_ptr = fb_ptr;
@@ -4013,7 +3926,7 @@ void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
       }
 
       texture_block_ptr = texture_page_ptr + (texture_offset & texture_mask);
-      load_128b(block->texels, texture_block_ptr);
+      block->texels = *(vec_8x16u *)texture_block_ptr;
 
       block->draw_mask_bits = right_mask_bits;
       block->fb_ptr = fb_ptr;
@@ -4027,17 +3940,13 @@ void setup_sprite_16bpp(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
   }
 }
 
-void setup_sprite_untextured(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
+#endif
+
+#ifndef NEON_BUILD
+
+void setup_sprite_untextured_512(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
  s32 v, s32 width, s32 height, u32 color)
 {
-  if((psx_gpu->render_state & (RENDER_STATE_MASK_EVALUATE |
-   RENDER_FLAGS_MODULATE_TEXELS | RENDER_FLAGS_BLEND)) == 0 &&
-   (psx_gpu->render_mode & RENDER_INTERLACE_ENABLED) == 0)
-  {
-    setup_sprite_untextured_simple(psx_gpu, x, y, u, v, width, height, color);
-    return;
-  }
-
   u32 right_width = ((width - 1) & 0x7) + 1;
   u32 right_mask_bits = (0xFF << right_width);
   u16 *fb_ptr = psx_gpu->vram_out_ptr + (y * 1024) + x;
@@ -4105,8 +4014,9 @@ void setup_sprite_untextured(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
 
 #endif
 
-void setup_sprite_untextured_simple(psx_gpu_struct *psx_gpu, s32 x, s32 y,
- s32 u, s32 v, s32 width, s32 height, u32 color)
+static void __attribute__((noinline))
+setup_sprite_untextured_simple(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
+ s32 v, s32 width, s32 height, u32 color)
 {
   u32 r = color & 0xFF;
   u32 g = (color >> 8) & 0xFF;
@@ -4120,7 +4030,7 @@ void setup_sprite_untextured_simple(psx_gpu_struct *psx_gpu, s32 x, s32 y,
 
   u32 num_width;
 
-  if(psx_gpu->num_blocks > MAX_BLOCKS)
+  if(psx_gpu->num_blocks)
   {
     flush_render_block_buffer(psx_gpu);
   }
@@ -4130,7 +4040,7 @@ void setup_sprite_untextured_simple(psx_gpu_struct *psx_gpu, s32 x, s32 y,
     num_width = width;
 
     vram_ptr = (void *)vram_ptr16;
-    if((long)vram_ptr16 & 2)
+    if((uintptr_t)vram_ptr16 & 2)
     {
       *vram_ptr16 = color_32bpp;
       vram_ptr = (void *)(vram_ptr16 + 1);
@@ -4161,6 +4071,29 @@ void setup_sprite_untextured_simple(psx_gpu_struct *psx_gpu, s32 x, s32 y,
 
     vram_ptr16 += 1024;
     height--;
+  }
+}
+
+void setup_sprite_untextured_512(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
+ s32 v, s32 width, s32 height, u32 color);
+
+void setup_sprite_untextured(psx_gpu_struct *psx_gpu, s32 x, s32 y, s32 u,
+ s32 v, s32 width, s32 height, u32 color)
+{
+  if((psx_gpu->render_state & (RENDER_STATE_MASK_EVALUATE |
+   RENDER_FLAGS_MODULATE_TEXELS | RENDER_FLAGS_BLEND)) == 0 &&
+   (psx_gpu->render_mode & RENDER_INTERLACE_ENABLED) == 0)
+  {
+    setup_sprite_untextured_simple(psx_gpu, x, y, u, v, width, height, color);
+    return;
+  }
+
+  while (width > 0)
+  {
+    s32 w1 = width > 512 ? 512 : width;
+    setup_sprite_untextured_512(psx_gpu, x, y, 0, 0, w1, height, color);
+    x += 512;
+    width -= 512;
   }
 }
 
@@ -4251,7 +4184,7 @@ void setup_sprite_untextured_simple(psx_gpu_struct *psx_gpu, s32 x, s32 y,
   render_sprite_blocks_switch_block_texture_mode(4bpp),                        \
   render_sprite_blocks_switch_block_texture_mode(8bpp),                        \
   render_sprite_blocks_switch_block_texture_mode(16bpp),                       \
-  render_sprite_blocks_switch_block_texture_mode(4bpp)                         \
+  render_sprite_blocks_switch_block_texture_mode(16bpp)                        \
 
 
 render_block_handler_struct render_sprite_block_handlers[] =
@@ -4261,10 +4194,10 @@ render_block_handler_struct render_sprite_block_handlers[] =
 
 
 void render_sprite(psx_gpu_struct *psx_gpu, s32 x, s32 y, u32 u, u32 v,
- s32 width, s32 height, u32 flags, u32 color)
+ s32 *width, s32 *height, u32 flags, u32 color)
 {
-  s32 x_right = x + width - 1;
-  s32 y_bottom = y + height - 1;
+  s32 x_right = x + *width - 1;
+  s32 y_bottom = y + *height - 1;
 
 #ifdef PROFILE
   sprites++;
@@ -4273,6 +4206,7 @@ void render_sprite(psx_gpu_struct *psx_gpu, s32 x, s32 y, u32 u, u32 v,
   if(invalidate_texture_cache_region_viewport(psx_gpu, x, y, x_right,
    y_bottom) == 0)
   {
+    *width = *height = 0;
     return;
   }
 
@@ -4281,7 +4215,7 @@ void render_sprite(psx_gpu_struct *psx_gpu, s32 x, s32 y, u32 u, u32 v,
     u32 clip = psx_gpu->viewport_start_x - x;
     x += clip;
     u += clip;
-    width -= clip;
+    *width -= clip;
   }
 
   if(y < psx_gpu->viewport_start_y)
@@ -4289,21 +4223,24 @@ void render_sprite(psx_gpu_struct *psx_gpu, s32 x, s32 y, u32 u, u32 v,
     s32 clip = psx_gpu->viewport_start_y - y;
     y += clip;
     v += clip;
-    height -= clip;
+    *height -= clip;
   }
 
   if(x_right > psx_gpu->viewport_end_x)
-    width -= x_right - psx_gpu->viewport_end_x;
+    *width -= x_right - psx_gpu->viewport_end_x;
 
   if(y_bottom > psx_gpu->viewport_end_y)
-    height -= y_bottom - psx_gpu->viewport_end_y;
+    *height -= y_bottom - psx_gpu->viewport_end_y;
 
-  if((width <= 0) || (height <= 0))
+  if((*width <= 0) || (*height <= 0))
+  {
+    *width = *height = 0;
     return;
+  }
 
 #ifdef PROFILE
-  span_pixels += width * height;
-  spans += height;
+  span_pixels += *width * *height;
+  spans += *height;
 #endif
 
   u32 render_state = flags &
@@ -4340,7 +4277,7 @@ void render_sprite(psx_gpu_struct *psx_gpu, s32 x, s32 y, u32 u, u32 v,
   psx_gpu->render_block_handler = render_block_handler;
 
   ((setup_sprite_function_type *)render_block_handler->setup_blocks)
-   (psx_gpu, x, y, u, v, width, height, color);
+   (psx_gpu, x, y, u, v, *width, *height, color);
 }
 
 #define draw_pixel_line_mask_evaluate_yes()                                    \
@@ -4651,6 +4588,7 @@ void render_line(psx_gpu_struct *psx_gpu, vertex_struct *vertexes, u32 flags,
   if(vertex_a->x >= vertex_b->x)
   {
     vertex_swap(vertex_a, vertex_b);
+    (void)triangle_winding;
   }
 
   x_a = vertex_a->x;
@@ -4957,6 +4895,7 @@ void render_block_fill_enh(psx_gpu_struct *psx_gpu, u32 color, u32 x, u32 y,
   }
 }
 
+#ifndef PCSX
 void render_block_copy(psx_gpu_struct *psx_gpu, u16 *source, u32 x, u32 y,
  u32 width, u32 height, u32 pitch)
 {
@@ -4988,7 +4927,7 @@ void render_block_move(psx_gpu_struct *psx_gpu, u32 source_x, u32 source_y,
   render_block_copy(psx_gpu, psx_gpu->vram_ptr + source_x + (source_y * 1024),
    dest_x, dest_y, width, height, 1024);
 }
-
+#endif
 
 void initialize_reciprocal_table(void)
 {
@@ -5044,6 +4983,8 @@ void initialize_psx_gpu(psx_gpu_struct *psx_gpu, u16 *vram)
   psx_gpu->texture_page_ptr = psx_gpu->vram_ptr;
   psx_gpu->clut_ptr = psx_gpu->vram_ptr;
 
+  psx_gpu->viewport_start_x = psx_gpu->viewport_start_y = 0;
+  psx_gpu->viewport_end_x = psx_gpu->viewport_end_y = 0;
   psx_gpu->mask_msb = 0;
 
   psx_gpu->texture_window_x = 0;
@@ -5076,7 +5017,10 @@ void initialize_psx_gpu(psx_gpu_struct *psx_gpu, u16 *vram)
 
   psx_gpu->primitive_type = PRIMITIVE_TYPE_UNKNOWN;
 
-  psx_gpu->enhancement_x_threshold = 256;
+  psx_gpu->saved_hres = 256;
+
+  // check some offset
+  psx_gpu->reserved_a[(offsetof(psx_gpu_struct, blocks) == psx_gpu_blocks_offset) - 1] = 0;
 }
 
 u64 get_us(void)
@@ -5087,7 +5031,7 @@ u64 get_us(void)
   return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
 }
 
-#ifdef NEON_BUILD
+#if 0 //def NEON_BUILD
 
 u32 get_counter()
 {
@@ -5142,3 +5086,5 @@ void triangle_benchmark(psx_gpu_struct *psx_gpu)
 #endif
 
 #include "psx_gpu_4x.c"
+
+// vim:ts=2:sw=2:expandtab

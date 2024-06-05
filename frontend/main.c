@@ -23,11 +23,23 @@
 #include "plat.h"
 #include "../libpcsxcore/misc.h"
 #include "../libpcsxcore/cheat.h"
+#include "../libpcsxcore/sio.h"
+#include "../libpcsxcore/database.h"
 #include "../libpcsxcore/new_dynarec/new_dynarec.h"
 #include "../plugins/cdrcimg/cdrcimg.h"
 #include "../plugins/dfsound/spu_config.h"
 #include "arm_features.h"
 #include "revision.h"
+
+#if defined(__EMSCRIPTEN__)
+#define DO_CPU_CHECKS 0
+#elif defined(__has_builtin)
+#define DO_CPU_CHECKS __has_builtin(__builtin_cpu_init)
+#elif defined(__x86_64__) || defined(__i386__)
+#define DO_CPU_CHECKS 1
+#else
+#define DO_CPU_CHECKS 0
+#endif
 
 #ifndef NO_FRONTEND
 #include "libpicofe/input.h"
@@ -43,8 +55,8 @@ static void check_memcards(void);
 #endif
 
 // don't include debug.h - it breaks ARM build (R1 redefined)
-void StartDebugger();
-void StopDebugger();
+static void StartDebugger() {}
+static void StopDebugger() {}
 
 int ready_to_go, g_emu_want_quit, g_emu_resetting;
 unsigned long gpuDisp;
@@ -121,9 +133,12 @@ static void set_default_paths(void)
 void emu_set_default_config(void)
 {
 	// try to set sane config on which most games work
-	Config.Xa = Config.Cdda = Config.Sio =
-	Config.SpuIrq = Config.RCntFix = Config.VSyncWA = 0;
+	Config.Xa = Config.Cdda = 0;
+	Config.icache_emulation = 0;
 	Config.PsxAuto = 1;
+	Config.cycle_multiplier = CYCLE_MULT_DEFAULT;
+	Config.GpuListWalking = -1;
+	Config.FractionalFramerate = -1;
 
 	pl_rearmed_cbs.gpu_neon.allow_interlace = 2; // auto
 	pl_rearmed_cbs.gpu_neon.enhancement_enable =
@@ -131,33 +146,33 @@ void emu_set_default_config(void)
 	pl_rearmed_cbs.gpu_peops.iUseDither = 0;
 	pl_rearmed_cbs.gpu_peops.dwActFixes = 1<<7;
 	pl_rearmed_cbs.gpu_unai.ilace_force = 0;
-	pl_rearmed_cbs.gpu_unai.pixel_skip = 1;
+	pl_rearmed_cbs.gpu_unai.pixel_skip = 0;
 	pl_rearmed_cbs.gpu_unai.lighting = 1;
-	pl_rearmed_cbs.gpu_unai.fast_lighting = 1;
+	pl_rearmed_cbs.gpu_unai.fast_lighting = 0;
 	pl_rearmed_cbs.gpu_unai.blending = 1;
 	pl_rearmed_cbs.gpu_unai.dithering = 0;
-	// old gpu_unai config
-	pl_rearmed_cbs.gpu_unai.abe_hack =
-	pl_rearmed_cbs.gpu_unai.no_light =
-	pl_rearmed_cbs.gpu_unai.no_blend = 0;
+	pl_rearmed_cbs.gpu_unai_old.abe_hack =
+	pl_rearmed_cbs.gpu_unai_old.no_light =
+	pl_rearmed_cbs.gpu_unai_old.no_blend = 0;
 	memset(&pl_rearmed_cbs.gpu_peopsgl, 0, sizeof(pl_rearmed_cbs.gpu_peopsgl));
 	pl_rearmed_cbs.gpu_peopsgl.iVRamSize = 64;
 	pl_rearmed_cbs.gpu_peopsgl.iTexGarbageCollection = 1;
 
 	spu_config.iUseReverb = 1;
-	spu_config.idiablofix = 0;
 	spu_config.iUseInterpolation = 1;
 	spu_config.iXAPitch = 0;
 	spu_config.iVolume = 768;
 	spu_config.iTempo = 0;
-	spu_config.iUseThread = 1; // no effect if only 1 core is detected
+	// may cause issues, no effect if only 1 core is detected
+	spu_config.iUseThread = 0;
 #if defined(HAVE_PRE_ARMV7) && !defined(_3DS) /* XXX GPH hack */
 	spu_config.iUseReverb = 0;
 	spu_config.iUseInterpolation = 0;
+#ifndef HAVE_LIBRETRO
 	spu_config.iTempo = 1;
 #endif
+#endif
 	new_dynarec_hacks = 0;
-	cycle_multiplier = 200;
 
 	in_type[0] = PSE_PAD_TYPE_STANDARD;
 	in_type[1] = PSE_PAD_TYPE_STANDARD;
@@ -276,6 +291,10 @@ do_state_slot:
 				SysMessage("GPU_open returned %d", ret);
 		}
 		return;
+	case SACTION_ANALOG_TOGGLE:
+		ret = padToggleAnalog(0);
+		snprintf(hud_msg, sizeof(hud_msg), "ANALOG %s", ret ? "ON" : "OFF");
+		break;
 #endif
 	default:
 		return;
@@ -307,7 +326,7 @@ static int cdidcmp(const char *id1, const char *id2)
 
 static void parse_cwcheat(void)
 {
-	char line[256], buf[64], name[64], *p;
+	char line[256], buf[256], name[256], *p;
 	int newcheat = 1;
 	u32 a, v;
 	FILE *f;
@@ -400,11 +419,78 @@ void emu_on_new_cd(int show_hud_msg)
 		SysPrintf("note: running with HLE BIOS, expect compatibility problems\n");
 		SysPrintf("----------------------------------------------------------\n");
 	}
+	if (Config.TurboCD)
+		SysPrintf("note: TurboCD is enabled, this breaks games\n");
 
 	if (show_hud_msg) {
-		snprintf(hud_msg, sizeof(hud_msg), BOOT_MSG);
+		if (check_unsatisfied_libcrypt())
+			snprintf(hud_msg, sizeof(hud_msg),
+				"LibCrypt protected game with missing SBI detected");
+		else
+			snprintf(hud_msg, sizeof(hud_msg), BOOT_MSG);
 		hud_new_msg = 3;
 	}
+}
+
+static void log_wrong_cpu(void)
+{
+#if DO_CPU_CHECKS
+	__builtin_cpu_init();
+	#define CHECK_CPU(name) if (!__builtin_cpu_supports(name)) \
+		SysPrintf("ERROR: compiled for " name ", which is unsupported by the CPU\n")
+#ifdef __SSE2__
+	CHECK_CPU("sse2");
+#endif
+#ifdef __SSSE3__
+	CHECK_CPU("ssse3");
+#endif
+#ifdef __SSE4_1__
+	CHECK_CPU("sse4.1");
+#endif
+#endif // DO_CPU_CHECKS
+}
+
+#define MKSTR2(x) #x
+#define MKSTR(x) MKSTR2(x)
+static const char *get_build_info(void)
+{
+	return " ("
+#ifdef __VERSION__
+		"cc " __VERSION__ " "
+#endif
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8
+		"64bit "
+#elif defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+		"32bit "
+#endif
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+		"be "
+#endif
+#if defined(__PIC__) || defined(__pic__)
+		"pic "
+#endif
+#if defined(__aarch64__)
+		"arm64"
+#elif defined(__arm__)
+		"arm"
+#endif
+#ifdef __ARM_ARCH
+		"v" MKSTR(__ARM_ARCH) " "
+#endif
+#if defined(__AVX__)
+		"avx "
+#elif defined(__SSSE3__)
+		"ssse3 "
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+		"neon "
+#endif
+#if defined(LIGHTREC)
+		"lightrec "
+#elif !defined(DRC_DISABLE)
+		"ari64 "
+#endif
+		"gpu=" MKSTR(BUILTIN_GPU)
+		")";
 }
 
 int emu_core_preinit(void)
@@ -421,6 +507,8 @@ int emu_core_preinit(void)
 #endif
 	emuLog = stdout;
 
+	log_wrong_cpu();
+
 	SetIsoFile(NULL);
 
 	memset(&Config, 0, sizeof(Config));
@@ -434,7 +522,7 @@ int emu_core_preinit(void)
 
 int emu_core_init(void)
 {
-	SysPrintf("Starting PCSX-ReARMed " REV "\n");
+	SysPrintf("Starting PCSX-ReARMed " REV "%s\n", get_build_info());
 
 #ifndef NO_FRONTEND
 	check_profile();
@@ -457,7 +545,7 @@ int emu_core_init(void)
 
 void emu_core_ask_exit(void)
 {
-	stop = 1;
+	stop++;
 	g_emu_want_quit = 1;
 }
 
@@ -511,6 +599,7 @@ int main(int argc, char *argv[])
 {
 	char file[MAXPATHLEN] = "";
 	char path[MAXPATHLEN];
+	char isofilename[MAXPATHLEN];
 	const char *cdfile = NULL;
 	const char *loadst_f = NULL;
 	int psxout = 0;
@@ -529,8 +618,6 @@ int main(int argc, char *argv[])
 			SysPrintf("Using config file %s.\n", cfgfile_basename);
 		}
 		else if (!strcmp(argv[i], "-cdfile")) {
-			char isofilename[MAXPATHLEN];
-
 			if (i+1 >= argc) break;
 			strncpy(isofilename, argv[++i], MAXPATHLEN);
 			if (isofilename[0] != '/') {
@@ -636,6 +723,8 @@ int main(int argc, char *argv[])
 	}
 
 	if (ready_to_go) {
+		if (menu_load_config(1) != 0)
+			menu_load_config(0);
 		menu_prepare_emu();
 
 		// If a state has been specified, then load that
@@ -673,8 +762,8 @@ static void toggle_fast_forward(int force_off)
 {
 	static int fast_forward;
 	static int normal_g_opts;
-	static int normal_frameskip;
 	static int normal_enhancement_enable;
+	//static int normal_frameskip;
 
 	if (force_off && !fast_forward)
 		return;
@@ -682,16 +771,16 @@ static void toggle_fast_forward(int force_off)
 	fast_forward = !fast_forward;
 	if (fast_forward) {
 		normal_g_opts = g_opts;
-		normal_frameskip = pl_rearmed_cbs.frameskip;
+		//normal_frameskip = pl_rearmed_cbs.frameskip;
 		normal_enhancement_enable =
 			pl_rearmed_cbs.gpu_neon.enhancement_enable;
 
 		g_opts |= OPT_NO_FRAMELIM;
-		pl_rearmed_cbs.frameskip = 3;
+		// pl_rearmed_cbs.frameskip = 3; // too broken
 		pl_rearmed_cbs.gpu_neon.enhancement_enable = 0;
 	} else {
 		g_opts = normal_g_opts;
-		pl_rearmed_cbs.frameskip = normal_frameskip;
+		//pl_rearmed_cbs.frameskip = normal_frameskip;
 		pl_rearmed_cbs.gpu_neon.enhancement_enable =
 			normal_enhancement_enable;
 
@@ -706,7 +795,7 @@ static void toggle_fast_forward(int force_off)
 static void SignalExit(int sig) {
 	// only to restore framebuffer/resolution on some devices
 	plat_finish();
-	exit(1);
+	_exit(1);
 }
 #endif
 
@@ -714,7 +803,7 @@ void SysRunGui() {
         printf("SysRunGui\n");
 }
 
-static void dummy_lace()
+static void CALLBACK dummy_lace()
 {
 }
 
@@ -729,7 +818,7 @@ void SysReset() {
 	// reset can run code, timing must be set
 	pl_timing_prepare(Config.PsxType);
 
-   // hmh core forgets this
+	// hmh core forgets this
 	CDR_stop();
    
 	EmuReset();
@@ -748,9 +837,6 @@ void SysClose() {
 		fclose(emuLog);
 		emuLog = NULL;
 	}
-}
-
-void SysUpdate() {
 }
 
 int get_state_filename(char *buf, int size, int i) {
@@ -859,8 +945,6 @@ static int _OpenPlugins(void) {
 	signal(SIGPIPE, SignalExit);
 #endif
 
-	GPU_clearDynarec(clearDynarec);
-
 	ret = CDR_open();
 	if (ret < 0) { SysMessage(_("Error opening CD-ROM plugin!")); return -1; }
 	ret = SPU_open();
@@ -883,8 +967,9 @@ static int _OpenPlugins(void) {
 		MAKE_PATH(dotdir, "/.pcsx/plugins/", NULL);
 
 		strcpy(info.EmuName, "PCSX");
-		strncpy(info.CdromID, CdromId, 9);
-		strncpy(info.CdromLabel, CdromLabel, 9);
+		memcpy(info.CdromID, CdromId, 9); /* no \0 trailing character? */
+		memcpy(info.CdromLabel, CdromLabel, 9);
+		info.CdromLabel[9] = '\0';
 		info.psxMem = psxM;
 		info.GPU_showScreenPic = GPU_showScreenPic;
 		info.GPU_displayText = GPU_displayText;
@@ -993,7 +1078,7 @@ void *SysLoadLibrary(const char *lib) {
 		tmp++;
 		for (i = 0; i < ARRAY_SIZE(builtin_plugins); i++)
 			if (strcmp(tmp, builtin_plugins[i]) == 0)
-				return (void *)(long)(PLUGIN_DL_BASE + builtin_plugin_ids[i]);
+				return (void *)(uintptr_t)(PLUGIN_DL_BASE + builtin_plugin_ids[i]);
 	}
 
 #if !defined(_WIN32) && !defined(NO_DYLIB)
@@ -1008,7 +1093,7 @@ void *SysLoadLibrary(const char *lib) {
 }
 
 void *SysLoadSym(void *lib, const char *sym) {
-	unsigned int plugid = (unsigned int)(long)lib;
+	unsigned int plugid = (unsigned int)(uintptr_t)lib;
 
 	if (PLUGIN_DL_BASE <= plugid && plugid < PLUGIN_DL_BASE + ARRAY_SIZE(builtin_plugins))
 		return plugin_link(plugid - PLUGIN_DL_BASE, sym);
@@ -1022,7 +1107,7 @@ void *SysLoadSym(void *lib, const char *sym) {
 
 const char *SysLibError() {
 #if defined(NO_DYLIB)
-   return NULL;
+	return NULL;
 #elif !defined(_WIN32)
 	return dlerror();
 #else
@@ -1031,7 +1116,7 @@ const char *SysLibError() {
 }
 
 void SysCloseLibrary(void *lib) {
-	unsigned int plugid = (unsigned int)(long)lib;
+	unsigned int plugid = (unsigned int)(uintptr_t)lib;
 
 	if (PLUGIN_DL_BASE <= plugid && plugid < PLUGIN_DL_BASE + ARRAY_SIZE(builtin_plugins))
 		return;

@@ -1,32 +1,31 @@
 LOCAL_PATH := $(call my-dir)
 
-$(shell cd "$(LOCAL_PATH)" && ((git describe || echo) | sed -e 's/.*/#define REV "\0"/' > ../frontend/revision.h_))
+$(shell cd "$(LOCAL_PATH)" && ((git describe --always || echo) | sed -e 's/.*/#define REV "\0"/' > ../frontend/revision.h_))
 $(shell cd "$(LOCAL_PATH)" && (diff -q ../frontend/revision.h_ ../frontend/revision.h > /dev/null 2>&1 || cp ../frontend/revision.h_ ../frontend/revision.h))
 $(shell cd "$(LOCAL_PATH)" && (rm ../frontend/revision.h_))
 
-HAVE_CHD ?= 1
+USE_LIBRETRO_VFS ?= 0
 
 ROOT_DIR     := $(LOCAL_PATH)/..
 CORE_DIR     := $(ROOT_DIR)/libpcsxcore
 SPU_DIR      := $(ROOT_DIR)/plugins/dfsound
 GPU_DIR      := $(ROOT_DIR)/plugins/gpulib
 CDR_DIR      := $(ROOT_DIR)/plugins/cdrcimg
-INPUT_DIR    := $(ROOT_DIR)/plugins/dfinput
 FRONTEND_DIR := $(ROOT_DIR)/frontend
 NEON_DIR     := $(ROOT_DIR)/plugins/gpu_neon
 UNAI_DIR     := $(ROOT_DIR)/plugins/gpu_unai
+PEOPS_DIR    := $(ROOT_DIR)/plugins/dfxvideo
 DYNAREC_DIR  := $(ROOT_DIR)/libpcsxcore/new_dynarec
 DEPS_DIR     := $(ROOT_DIR)/deps
-LIBRETRO_COMMON := $(ROOT_DIR)/libretro-common
+LIBRETRO_COMMON := $(DEPS_DIR)/libretro-common
 EXTRA_INCLUDES :=
 
 # core
 SOURCES_C := $(CORE_DIR)/cdriso.c \
              $(CORE_DIR)/cdrom.c \
              $(CORE_DIR)/cheat.c \
-             $(CORE_DIR)/debug.c \
+             $(CORE_DIR)/database.c \
              $(CORE_DIR)/decode_xa.c \
-             $(CORE_DIR)/disr3000a.c \
              $(CORE_DIR)/mdec.c \
              $(CORE_DIR)/misc.c \
              $(CORE_DIR)/plugins.c \
@@ -35,14 +34,14 @@ SOURCES_C := $(CORE_DIR)/cdriso.c \
              $(CORE_DIR)/psxcommon.c \
              $(CORE_DIR)/psxcounters.c \
              $(CORE_DIR)/psxdma.c \
-             $(CORE_DIR)/psxhle.c \
+             $(CORE_DIR)/psxevents.c \
              $(CORE_DIR)/psxhw.c \
              $(CORE_DIR)/psxinterpreter.c \
              $(CORE_DIR)/psxmem.c \
              $(CORE_DIR)/r3000a.c \
              $(CORE_DIR)/sio.c \
-             $(CORE_DIR)/socket.c \
              $(CORE_DIR)/spu.c \
+             $(CORE_DIR)/gpu.c \
              $(CORE_DIR)/gte.c \
              $(CORE_DIR)/gte_nf.c \
              $(CORE_DIR)/gte_divider.c
@@ -62,11 +61,6 @@ SOURCES_C += $(GPU_DIR)/gpu.c \
 # cdrcimg
 SOURCES_C += $(CDR_DIR)/cdrcimg.c
 
-# dfinput
-SOURCES_C += $(INPUT_DIR)/main.c \
-             $(INPUT_DIR)/pad.c \
-             $(INPUT_DIR)/guncon.c
-
 # frontend
 SOURCES_C += $(FRONTEND_DIR)/main.c \
              $(FRONTEND_DIR)/plugin.c \
@@ -74,83 +68,107 @@ SOURCES_C += $(FRONTEND_DIR)/main.c \
              $(FRONTEND_DIR)/libretro.c
 
 # libchdr
+LCHDR = $(DEPS_DIR)/libchdr
+LCHDR_LZMA = $(LCHDR)/deps/lzma-24.05
+LCHDR_ZSTD = $(LCHDR)/deps/zstd-1.5.6/lib
 SOURCES_C += \
-             $(DEPS_DIR)/crypto/md5.c \
-             $(DEPS_DIR)/crypto/sha1.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/bitmath.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/bitreader.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/cpu.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/crc.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/fixed.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/fixed_intrin_sse2.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/fixed_intrin_ssse3.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/float.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/format.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/lpc.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/lpc_intrin_avx2.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/lpc_intrin_sse2.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/lpc_intrin_sse41.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/lpc_intrin_sse.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/md5.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/memory.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/metadata_iterators.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/metadata_object.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/stream_decoder.c \
-             $(DEPS_DIR)/flac-1.3.2/src/libFLAC/window.c \
-             $(DEPS_DIR)/lzma-16.04/C/Alloc.c \
-             $(DEPS_DIR)/lzma-16.04/C/Bra86.c \
-             $(DEPS_DIR)/lzma-16.04/C/Bra.c \
-             $(DEPS_DIR)/lzma-16.04/C/BraIA64.c \
-             $(DEPS_DIR)/lzma-16.04/C/CpuArch.c \
-             $(DEPS_DIR)/lzma-16.04/C/Delta.c \
-             $(DEPS_DIR)/lzma-16.04/C/LzFind.c \
-             $(DEPS_DIR)/lzma-16.04/C/Lzma86Dec.c \
-             $(DEPS_DIR)/lzma-16.04/C/Lzma86Enc.c \
-             $(DEPS_DIR)/lzma-16.04/C/LzmaDec.c \
-             $(DEPS_DIR)/lzma-16.04/C/LzmaEnc.c \
-             $(DEPS_DIR)/lzma-16.04/C/LzmaLib.c \
-             $(DEPS_DIR)/lzma-16.04/C/Sort.c \
-             $(DEPS_DIR)/libchdr/bitstream.c \
-             $(DEPS_DIR)/libchdr/cdrom.c \
-             $(DEPS_DIR)/libchdr/chd.c \
-             $(DEPS_DIR)/libchdr/flac.c \
-             $(DEPS_DIR)/libchdr/huffman.c
+	     $(LCHDR)/src/libchdr_bitstream.c \
+	     $(LCHDR)/src/libchdr_cdrom.c \
+	     $(LCHDR)/src/libchdr_chd.c \
+	     $(LCHDR)/src/libchdr_flac.c \
+	     $(LCHDR)/src/libchdr_huffman.c \
+	     $(LCHDR_LZMA)/src/Alloc.c \
+	     $(LCHDR_LZMA)/src/CpuArch.c \
+	     $(LCHDR_LZMA)/src/Delta.c \
+	     $(LCHDR_LZMA)/src/LzFind.c \
+	     $(LCHDR_LZMA)/src/LzmaDec.c \
+	     $(LCHDR_LZMA)/src/LzmaEnc.c \
+	     $(LCHDR_LZMA)/src/Sort.c \
+	     $(LCHDR_ZSTD)/common/entropy_common.c \
+	     $(LCHDR_ZSTD)/common/error_private.c \
+	     $(LCHDR_ZSTD)/common/fse_decompress.c \
+	     $(LCHDR_ZSTD)/common/xxhash.c \
+	     $(LCHDR_ZSTD)/common/zstd_common.c \
+	     $(LCHDR_ZSTD)/decompress/huf_decompress.c \
+	     $(LCHDR_ZSTD)/decompress/zstd_ddict.c \
+	     $(LCHDR_ZSTD)/decompress/zstd_decompress_block.c \
+	     $(LCHDR_ZSTD)/decompress/zstd_decompress.c
 SOURCES_ASM :=
+EXTRA_INCLUDES += $(LCHDR)/include $(LCHDR_LZMA)/include $(LCHDR_ZSTD)
+COREFLAGS += -DHAVE_CHD -DZ7_ST -DZSTD_DISABLE_ASM
+ifeq (,$(call gte,$(APP_PLATFORM_LEVEL),18))
+ifneq ($(TARGET_ARCH_ABI),arm64-v8a)
+# HACK
+COREFLAGS += -Dgetauxval=0*
+endif
+endif
 
-COREFLAGS := -ffast-math -funroll-loops -DHAVE_LIBRETRO -DNO_FRONTEND -DFRONTEND_SUPPORTS_RGB565 -DANDROID -DREARMED
-COREFLAGS += -DPACKAGE_VERSION=\"1.3.2\" -DFLAC__HAS_OGG=0 -DFLAC__NO_DLL -DHAVE_LROUND -DHAVE_STDINT_H -DHAVE_STDLIB_H -DFLAC__NO_DLL -D_7ZIP_ST -DHAVE_SYS_PARAM_H
-COREFLAGS += -DHAVE_CHD
+COREFLAGS += -ffast-math -funroll-loops -DHAVE_LIBRETRO -DNO_FRONTEND -DFRONTEND_SUPPORTS_RGB565 -DANDROID -DREARMED
+COREFLAGS += -DP_HAVE_MMAP=1 -DP_HAVE_PTHREAD=1 -DP_HAVE_POSIX_MEMALIGN=1
+
+ifeq ($(USE_LIBRETRO_VFS),1)
+SOURCES_C += \
+             $(LIBRETRO_COMMON)/compat/compat_posix_string.c \
+             $(LIBRETRO_COMMON)/compat/fopen_utf8.c \
+             $(LIBRETRO_COMMON)/encodings/compat_strl.c \
+             $(LIBRETRO_COMMON)/encodings/encoding_utf.c \
+             $(LIBRETRO_COMMON)/file/file_path.c \
+             $(LIBRETRO_COMMON)/streams/file_stream.c \
+             $(LIBRETRO_COMMON)/streams/file_stream_transforms.c \
+             $(LIBRETRO_COMMON)/string/stdstring.c \
+             $(LIBRETRO_COMMON)/time/rtime.c \
+             $(LIBRETRO_COMMON)/vfs/vfs_implementation.c
+COREFLAGS += -DUSE_LIBRETRO_VFS
+endif
+EXTRA_INCLUDES += $(LIBRETRO_COMMON)/include
 
 HAVE_ARI64=0
 HAVE_LIGHTREC=0
+LIGHTREC_CUSTOM_MAP=0
+LIGHTREC_THREADED_COMPILER=0
+HAVE_GPU_NEON=0
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   HAVE_ARI64=1
+  HAVE_GPU_NEON=1
 else ifeq ($(TARGET_ARCH_ABI),armeabi)
   HAVE_ARI64=1
 else ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
-  HAVE_LIGHTREC=1
+  HAVE_ARI64=1
+  HAVE_GPU_NEON=1
 else ifeq ($(TARGET_ARCH_ABI),x86_64)
   HAVE_LIGHTREC=1
+  HAVE_GPU_NEON=1
 else ifeq ($(TARGET_ARCH_ABI),x86)
   HAVE_LIGHTREC=1
+  HAVE_GPU_NEON=1
 else
   COREFLAGS   += -DDRC_DISABLE
 endif
+  COREFLAGS   += -DLIGHTREC_CUSTOM_MAP=$(LIGHTREC_CUSTOM_MAP)
+  COREFLAGS   += -DLIGHTREC_ENABLE_THREADED_COMPILER=$(LIGHTREC_THREADED_COMPILER)
 
 ifeq ($(HAVE_ARI64),1)
-  COREFLAGS   += -DNEW_DYNAREC
-  SOURCES_ASM += $(CORE_DIR)/gte_arm.S \
-                 $(SPU_DIR)/arm_utils.S \
-                 $(DYNAREC_DIR)/arm/linkage_arm.S
   SOURCES_C   += $(DYNAREC_DIR)/new_dynarec.c \
-                 $(DYNAREC_DIR)/backends/psx/pcsxmem.c
+                 $(DYNAREC_DIR)/pcsxmem.c
+  ifeq ($(TARGET_ARCH_ABI),arm64-v8a)
+    SOURCES_ASM += $(DYNAREC_DIR)/linkage_arm64.S
+  else
+    SOURCES_ASM += $(CORE_DIR)/gte_arm.S \
+                   $(SPU_DIR)/arm_utils.S \
+                   $(DYNAREC_DIR)/linkage_arm.S
+  endif
 endif
+  SOURCES_C   += $(DYNAREC_DIR)/emu_if.c
 
 ifeq ($(HAVE_LIGHTREC),1)
-  COREFLAGS   += -DLIGHTREC -DLIGHTREC_STATIC
+  COREFLAGS   += -DLIGHTREC -DLIGHTREC_STATIC -DLIGHTREC_CODE_INV=0
   EXTRA_INCLUDES += $(DEPS_DIR)/lightning/include \
-						  $(DEPS_DIR)/lightrec
+		    $(DEPS_DIR)/lightrec \
+		    $(DEPS_DIR)/lightrec/tlsf \
+		    $(ROOT_DIR)/include/lightning \
+		    $(ROOT_DIR)/include/lightrec
   SOURCES_C   += $(DEPS_DIR)/lightrec/blockcache.c \
+					  $(DEPS_DIR)/lightrec/constprop.c \
 					  $(DEPS_DIR)/lightrec/disassembler.c \
 					  $(DEPS_DIR)/lightrec/emitter.c \
 					  $(DEPS_DIR)/lightrec/interpreter.c \
@@ -158,7 +176,9 @@ ifeq ($(HAVE_LIGHTREC),1)
 					  $(DEPS_DIR)/lightrec/memmanager.c \
 					  $(DEPS_DIR)/lightrec/optimizer.c \
 					  $(DEPS_DIR)/lightrec/regcache.c \
-					  $(DEPS_DIR)/lightrec/recompiler.c
+					  $(DEPS_DIR)/lightrec/recompiler.c \
+					  $(DEPS_DIR)/lightrec/reaper.c \
+					  $(DEPS_DIR)/lightrec/tlsf/tlsf.c
   SOURCES_C   += $(DEPS_DIR)/lightning/lib/jit_disasm.c \
 					  $(DEPS_DIR)/lightning/lib/jit_memory.c \
 					  $(DEPS_DIR)/lightning/lib/jit_names.c \
@@ -167,26 +187,33 @@ ifeq ($(HAVE_LIGHTREC),1)
 					  $(DEPS_DIR)/lightning/lib/jit_size.c \
 					  $(DEPS_DIR)/lightning/lib/lightning.c
   SOURCES_C   += $(CORE_DIR)/lightrec/plugin.c
+ifeq ($(LIGHTREC_CUSTOM_MAP),1)
+  SOURCES_C   += $(CORE_DIR)/lightrec/mem.c
+endif
 endif
 
 
-ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+ifeq ($(HAVE_GPU_NEON),1)
   COREFLAGS   += -DNEON_BUILD -DTEXTURE_CACHE_4BPP -DTEXTURE_CACHE_8BPP -DGPU_NEON
-  SOURCES_ASM += $(CORE_DIR)/gte_neon.S \
-                 $(NEON_DIR)/psx_gpu/psx_gpu_arm_neon.S \
-                 $(FRONTEND_DIR)/cspace_neon.S
+  ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+    COREFLAGS   += -DHAVE_bgr555_to_rgb565 -DHAVE_bgr888_to_x
+    SOURCES_ASM += $(CORE_DIR)/gte_neon.S \
+                   $(NEON_DIR)/psx_gpu/psx_gpu_arm_neon.S \
+                   $(FRONTEND_DIR)/cspace_neon.S
+  else
+    COREFLAGS   += -DSIMD_BUILD
+    SOURCES_C   += $(NEON_DIR)/psx_gpu/psx_gpu_simd.c
+  endif
   SOURCES_C   += $(NEON_DIR)/psx_gpu_if.c
-  SOURCES_C   += $(DYNAREC_DIR)/backends/psx/emu_if.c
 else ifeq ($(TARGET_ARCH_ABI),armeabi)
-  COREFLAGS += -DUSE_GPULIB=1 -DGPU_UNAI
-  COREFLAGS += -DINLINE="static __inline__" -Dasm="__asm__ __volatile__"
+  COREFLAGS   += -DUSE_GPULIB=1 -DGPU_UNAI
+  COREFLAGS   += -DHAVE_bgr555_to_rgb565
   SOURCES_ASM += $(UNAI_DIR)/gpu_arm.S \
                  $(FRONTEND_DIR)/cspace_arm.S
   SOURCES_C += $(UNAI_DIR)/gpulib_if.cpp
 else
-  COREFLAGS += -DUSE_GPULIB=1 -DGPU_UNAI
-  COREFLAGS += -DINLINE="static __inline__" -Dasm="__asm__ __volatile__"
-  SOURCES_C += $(UNAI_DIR)/gpulib_if.cpp
+  COREFLAGS += -fno-strict-aliasing -DGPU_PEOPS
+  SOURCES_C += $(PEOPS_DIR)/gpulib_if.c
 endif
 
 GIT_VERSION := " $(shell git rev-parse --short HEAD || echo unknown)"
@@ -199,8 +226,7 @@ LOCAL_MODULE        := retro
 LOCAL_SRC_FILES     := $(SOURCES_C) $(SOURCES_ASM)
 LOCAL_CFLAGS        := $(COREFLAGS)
 LOCAL_C_INCLUDES    := $(ROOT_DIR)/include
-LOCAL_C_INCLUDES    += $(DEPS_DIR)/crypto $(DEPS_DIR)/flac-1.3.2/include $(DEPS_DIR)/flac-1.3.2/src/libFLAC/include $(DEPS_DIR)/lzma-16.04/C $(DEPS_DIR)/libchdr
-LOCAL_C_INCLUDES    += $(LIBRETRO_COMMON)/include
+LOCAL_C_INCLUDES    += $(DEPS_DIR)/crypto
 LOCAL_C_INCLUDES    += $(EXTRA_INCLUDES)
 LOCAL_LDFLAGS       := -Wl,-version-script=$(FRONTEND_DIR)/link.T
 LOCAL_LDLIBS        := -lz -llog
@@ -208,9 +234,6 @@ LOCAL_ARM_MODE      := arm
 
 ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
   LOCAL_ARM_NEON  := true
-endif
-ifeq ($(TARGET_ARCH),arm)
-  LOCAL_LDLIBS    += -Wl,-no-warn-shared-textrel
 endif
 
 include $(BUILD_SHARED_LIBRARY)

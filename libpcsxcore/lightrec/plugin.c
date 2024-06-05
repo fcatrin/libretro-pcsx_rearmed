@@ -1,9 +1,15 @@
-#include <lightrec.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <signal.h>
+#include <assert.h>
 
+#if P_HAVE_MMAP
+#include <sys/mman.h>
+#endif
+
+#include "lightrec.h"
 #include "../cdrom.h"
 #include "../gpu.h"
 #include "../gte.h"
@@ -12,8 +18,18 @@
 #include "../psxhw.h"
 #include "../psxmem.h"
 #include "../r3000a.h"
+#include "../psxinterpreter.h"
+#include "../psxhle.h"
+#include "../psxevents.h"
 
 #include "../frontend/main.h"
+
+#include "mem.h"
+#include "plugin.h"
+
+#if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
+#error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
+#endif
 
 #define ARRAY_SIZE(x) (sizeof(x) ? sizeof(x) / sizeof((x)[0]) : 0)
 
@@ -37,26 +53,22 @@
 #	define unlikely(x)     (x)
 #endif
 
+psxRegisters psxRegs;
+Rcnt rcnts[4];
+
+void* code_buffer;
+
 static struct lightrec_state *lightrec_state;
 
 static char *name = "retroarch.exe";
 
 static bool use_lightrec_interpreter;
-static bool lightrec_debug;
-static bool lightrec_very_debug;
-static u32 lightrec_begin_cycles;
+static bool use_pcsx_interpreter;
+static bool block_stepping;
 
-int stop;
-u32 cycle_multiplier;
-int new_dynarec_hacks;
+extern u32 lightrec_hacks;
 
-/* Unused for now */
-u32 event_cycles[PSXINT_COUNT];
-u32 next_interupt;
-
-void new_dyna_before_save() {}
-void new_dyna_after_save() {}
-void new_dyna_freeze(void *f, int i) {}
+extern void lightrec_code_inv(void *ptr, uint32_t len);
 
 enum my_cp2_opcodes {
 	OP_CP2_RTPS		= 0x01,
@@ -111,171 +123,114 @@ static void (*cp2_ops[])(struct psxCP2Regs *) = {
 
 static char cache_buf[64 * 1024];
 
-static u32 cop0_mfc(struct lightrec_state *state, u8 reg)
+static void cop2_op(struct lightrec_state *state, u32 func)
 {
-	return psxRegs.CP0.r[reg];
-}
+	struct lightrec_registers *regs = lightrec_get_registers(state);
 
-static u32 cop2_mfc_cfc(struct lightrec_state *state, u8 reg, bool cfc)
-{
-	if (cfc)
-		return psxRegs.CP2C.r[reg];
-	else
-		return MFC2(reg);
-}
+	psxRegs.code = func;
 
-static u32 cop2_mfc(struct lightrec_state *state, u8 reg)
-{
-	return cop2_mfc_cfc(state, reg, false);
-}
-
-static u32 cop2_cfc(struct lightrec_state *state, u8 reg)
-{
-	return cop2_mfc_cfc(state, reg, true);
-}
-
-static void cop0_mtc_ctc(struct lightrec_state *state,
-			 u8 reg, u32 value, bool ctc)
-{
-	switch (reg) {
-	case 1:
-	case 4:
-	case 8:
-	case 14:
-	case 15:
-		/* Those registers are read-only */
-		break;
-	case 12: /* Status */
-		if ((psxRegs.CP0.n.Status & ~value) & (1 << 16)) {
-			memcpy(psxM, cache_buf, sizeof(cache_buf));
-			lightrec_invalidate_all(state);
-		} else if ((~psxRegs.CP0.n.Status & value) & (1 << 16)) {
-			memcpy(cache_buf, psxM, sizeof(cache_buf));
-		}
-
-		psxRegs.CP0.n.Status = value;
-		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
-		break;
-	case 13: /* Cause */
-		psxRegs.CP0.n.Cause &= ~0x0300;
-		psxRegs.CP0.n.Cause |= value & 0x0300;
-		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
-		break;
-	default:
-		psxRegs.CP0.r[reg] = value;
-		break;
+	if (unlikely(!cp2_ops[func & 0x3f])) {
+		fprintf(stderr, "Invalid CP2 function %u\n", func);
+	} else {
+		/* This works because regs->cp2c comes right after regs->cp2d,
+		 * so it can be cast to a pcsxCP2Regs pointer. */
+		cp2_ops[func & 0x3f]((psxCP2Regs *) regs->cp2d);
 	}
 }
 
-static void cop2_mtc_ctc(struct lightrec_state *state,
-			 u8 reg, u32 value, bool ctc)
+static bool has_interrupt(void)
 {
-	if (ctc)
-		CTC2(value, reg);
-	else
-		MTC2(value, reg);
+	struct lightrec_registers *regs = lightrec_get_registers(lightrec_state);
+
+	return ((psxHu32(0x1070) & psxHu32(0x1074)) &&
+		(regs->cp0[12] & 0x401) == 0x401) ||
+		(regs->cp0[12] & regs->cp0[13] & 0x0300);
 }
 
-static void cop0_mtc(struct lightrec_state *state, u8 reg, u32 value)
+static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 {
-	cop0_mtc_ctc(state, reg, value, false);
+	psxRegs.cycle += lightrec_current_cycle_count(state) / 1024;
+	lightrec_reset_cycle_count(state, 0);
 }
 
-static void cop0_ctc(struct lightrec_state *state, u8 reg, u32 value)
+static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 {
-	cop0_mtc_ctc(state, reg, value, true);
+	s32 cycles_left = next_interupt - psxRegs.cycle;
+
+	if (block_stepping || cycles_left <= 0 || has_interrupt())
+		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
+	else {
+		lightrec_set_target_cycle_count(state, cycles_left * 1024);
+	}
 }
 
-static void cop2_mtc(struct lightrec_state *state, u8 reg, u32 value)
+static void hw_write_byte(struct lightrec_state *state,
+			  u32 op, void *host, u32 mem, u32 val)
 {
-	cop2_mtc_ctc(state, reg, value, false);
-}
-
-static void cop2_ctc(struct lightrec_state *state, u8 reg, u32 value)
-{
-	cop2_mtc_ctc(state, reg, value, true);
-}
-
-static void cop0_op(struct lightrec_state *state, u32 func)
-{
-	fprintf(stderr, "Invalid access to COP0\n");
-}
-
-static void cop2_op(struct lightrec_state *state, u32 func)
-{
-	psxRegs.code = func;
-
-	if (unlikely(!cp2_ops[func & 0x3f]))
-		fprintf(stderr, "Invalid CP2 function %u\n", func);
-	else
-		cp2_ops[func & 0x3f](&psxRegs.CP2);
-}
-
-static void hw_write_byte(struct lightrec_state *state, u32 mem, u8 val)
-{
-	psxRegs.cycle = lightrec_current_cycle_count(state);
+	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite8(mem, val);
-	lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 
-	lightrec_reset_cycle_count(state, psxRegs.cycle);
+	lightrec_tansition_from_pcsx(state);
 }
 
-static void hw_write_half(struct lightrec_state *state, u32 mem, u16 val)
+static void hw_write_half(struct lightrec_state *state,
+			  u32 op, void *host, u32 mem, u32 val)
 {
-	psxRegs.cycle = lightrec_current_cycle_count(state);
+	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite16(mem, val);
-	lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 
-	lightrec_reset_cycle_count(state, psxRegs.cycle);
+	lightrec_tansition_from_pcsx(state);
 }
 
-static void hw_write_word(struct lightrec_state *state, u32 mem, u32 val)
+static void hw_write_word(struct lightrec_state *state,
+			  u32 op, void *host, u32 mem, u32 val)
 {
-	psxRegs.cycle = lightrec_current_cycle_count(state);
+	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite32(mem, val);
-	lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 
-	lightrec_reset_cycle_count(state, psxRegs.cycle);
+	lightrec_tansition_from_pcsx(state);
 }
 
-static u8 hw_read_byte(struct lightrec_state *state, u32 mem)
+static u8 hw_read_byte(struct lightrec_state *state, u32 op, void *host, u32 mem)
 {
 	u8 val;
 
-	psxRegs.cycle = lightrec_current_cycle_count(state);
+	lightrec_tansition_to_pcsx(state);
 
-	lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 	val = psxHwRead8(mem);
-	lightrec_reset_cycle_count(state, psxRegs.cycle);
+
+	lightrec_tansition_from_pcsx(state);
 
 	return val;
 }
 
-static u16 hw_read_half(struct lightrec_state *state, u32 mem)
+static u16 hw_read_half(struct lightrec_state *state,
+			u32 op, void *host, u32 mem)
 {
 	u16 val;
 
-	psxRegs.cycle = lightrec_current_cycle_count(state);
+	lightrec_tansition_to_pcsx(state);
 
-	lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 	val = psxHwRead16(mem);
-	lightrec_reset_cycle_count(state, psxRegs.cycle);
+
+	lightrec_tansition_from_pcsx(state);
 
 	return val;
 }
 
-static u32 hw_read_word(struct lightrec_state *state, u32 mem)
+static u32 hw_read_word(struct lightrec_state *state,
+			u32 op, void *host, u32 mem)
 {
 	u32 val;
 
-	psxRegs.cycle = lightrec_current_cycle_count(state);
+	lightrec_tansition_to_pcsx(state);
 
-	lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 	val = psxHwRead32(mem);
-	lightrec_reset_cycle_count(state, psxRegs.cycle);
+
+	lightrec_tansition_from_pcsx(state);
 
 	return val;
 }
@@ -291,12 +246,14 @@ static struct lightrec_mem_map_ops hw_regs_ops = {
 
 static u32 cache_ctrl;
 
-static void cache_ctrl_write_word(struct lightrec_state *state, u32 mem, u32 val)
+static void cache_ctrl_write_word(struct lightrec_state *state,
+				  u32 op, void *host, u32 mem, u32 val)
 {
 	cache_ctrl = val;
 }
 
-static u32 cache_ctrl_read_word(struct lightrec_state *state, u32 mem)
+static u32 cache_ctrl_read_word(struct lightrec_state *state,
+				u32 op, void *host, u32 mem)
 {
 	return cache_ctrl;
 }
@@ -330,7 +287,7 @@ static struct lightrec_mem_map lightrec_map[] = {
 	[PSX_MAP_HW_REGISTERS] = {
 		/* Hardware registers */
 		.pc = 0x1f801000,
-		.length = 0x2000,
+		.length = 0x8000,
 		.ops = &hw_regs_ops,
 	},
 	[PSX_MAP_CACHE_CONTROL] = {
@@ -356,23 +313,117 @@ static struct lightrec_mem_map lightrec_map[] = {
 		.length = 0x200000,
 		.mirror_of = &lightrec_map[PSX_MAP_KERNEL_USER_RAM],
 	},
+
+	/* Mirror of the parallel port. Only used by the PS2/PS3 BIOS */
+	[PSX_MAP_PPORT_MIRROR] = {
+		.pc = 0x1fa00000,
+		.length = 0x10000,
+		.mirror_of = &lightrec_map[PSX_MAP_PARALLEL_PORT],
+	},
+
+	/* Code buffer */
+	[PSX_MAP_CODE_BUFFER] = {
+		.length = CODE_BUFFER_SIZE,
+	},
 };
 
+static void lightrec_enable_ram(struct lightrec_state *state, bool enable)
+{
+	if (enable)
+		memcpy(psxM, cache_buf, sizeof(cache_buf));
+	else
+		memcpy(cache_buf, psxM, sizeof(cache_buf));
+}
+
+static bool lightrec_can_hw_direct(u32 kaddr, bool is_write, u8 size)
+{
+	if (is_write && size != 32) {
+		// force32 so must go through handlers
+		if (0x1f801000 <= kaddr && kaddr < 0x1f801024)
+			return false;
+		if ((kaddr & 0x1fffff80) == 0x1f801080) // dma
+			return false;
+	}
+
+	switch (size) {
+	case 8:
+		switch (kaddr) {
+		case 0x1f801040:
+		case 0x1f801050:
+		case 0x1f801800:
+		case 0x1f801801:
+		case 0x1f801802:
+		case 0x1f801803:
+			return false;
+		default:
+			return true;
+		}
+	case 16:
+		switch (kaddr) {
+		case 0x1f801040:
+		case 0x1f801044:
+		case 0x1f801048:
+		case 0x1f80104a:
+		case 0x1f80104e:
+		case 0x1f801050:
+		case 0x1f801054:
+		case 0x1f80105a:
+		case 0x1f80105e:
+		case 0x1f801100:
+		case 0x1f801104:
+		case 0x1f801108:
+		case 0x1f801110:
+		case 0x1f801114:
+		case 0x1f801118:
+		case 0x1f801120:
+		case 0x1f801124:
+		case 0x1f801128:
+			return false;
+		case 0x1f801070:
+		case 0x1f801074:
+			return !is_write;
+		default:
+			return kaddr < 0x1f801c00 || kaddr >= 0x1f801e00;
+		}
+	default:
+		switch (kaddr) {
+		case 0x1f801040:
+		case 0x1f801050:
+		case 0x1f801100:
+		case 0x1f801104:
+		case 0x1f801108:
+		case 0x1f801110:
+		case 0x1f801114:
+		case 0x1f801118:
+		case 0x1f801120:
+		case 0x1f801124:
+		case 0x1f801128:
+		case 0x1f801810:
+		case 0x1f801814:
+		case 0x1f801820:
+		case 0x1f801824:
+			return false;
+		case 0x1f801070:
+		case 0x1f801074:
+		case 0x1f801088:
+		case 0x1f801098:
+		case 0x1f8010a8:
+		case 0x1f8010b8:
+		case 0x1f8010c8:
+		case 0x1f8010e8:
+		case 0x1f8010f4:
+			return !is_write;
+		default:
+			return !is_write || kaddr < 0x1f801c00 || kaddr >= 0x1f801e00;
+		}
+	}
+}
+
 static const struct lightrec_ops lightrec_ops = {
-	.cop0_ops = {
-		.mfc = cop0_mfc,
-		.cfc = cop0_mfc,
-		.mtc = cop0_mtc,
-		.ctc = cop0_ctc,
-		.op = cop0_op,
-	},
-	.cop2_ops = {
-		.mfc = cop2_mfc,
-		.cfc = cop2_cfc,
-		.mtc = cop2_mtc,
-		.ctc = cop2_ctc,
-		.op = cop2_op,
-	},
+	.cop2_op = cop2_op,
+	.enable_ram = lightrec_enable_ram,
+	.hw_direct = lightrec_can_hw_direct,
+	.code_inv = LIGHTREC_CODE_INV ? lightrec_code_inv : NULL,
 };
 
 static int lightrec_plugin_init(void)
@@ -380,24 +431,42 @@ static int lightrec_plugin_init(void)
 	lightrec_map[PSX_MAP_KERNEL_USER_RAM].address = psxM;
 	lightrec_map[PSX_MAP_BIOS].address = psxR;
 	lightrec_map[PSX_MAP_SCRATCH_PAD].address = psxH;
+	lightrec_map[PSX_MAP_HW_REGISTERS].address = psxH + 0x1000;
 	lightrec_map[PSX_MAP_PARALLEL_PORT].address = psxP;
 
-	lightrec_debug = !!getenv("LIGHTREC_DEBUG");
-	lightrec_very_debug = !!getenv("LIGHTREC_VERY_DEBUG");
+	if (!LIGHTREC_CUSTOM_MAP) {
+#if P_HAVE_MMAP
+		code_buffer = mmap(0, CODE_BUFFER_SIZE,
+				   PROT_EXEC | PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (code_buffer == MAP_FAILED)
+			return -ENOMEM;
+#else
+		code_buffer = malloc(CODE_BUFFER_SIZE);
+		if (!code_buffer)
+			return -ENOMEM;
+#endif
+	}
+
+	if (LIGHTREC_CUSTOM_MAP) {
+		lightrec_map[PSX_MAP_MIRROR1].address = psxM + 0x200000;
+		lightrec_map[PSX_MAP_MIRROR2].address = psxM + 0x400000;
+		lightrec_map[PSX_MAP_MIRROR3].address = psxM + 0x600000;
+	}
+
+	lightrec_map[PSX_MAP_CODE_BUFFER].address = code_buffer;
+
 	use_lightrec_interpreter = !!getenv("LIGHTREC_INTERPRETER");
-	if (getenv("LIGHTREC_BEGIN_CYCLES"))
-	  lightrec_begin_cycles = (unsigned int) strtol(
-				  getenv("LIGHTREC_BEGIN_CYCLES"), NULL, 0);
 
 	lightrec_state = lightrec_init(name,
 			lightrec_map, ARRAY_SIZE(lightrec_map),
 			&lightrec_ops);
 
-	fprintf(stderr, "M=0x%lx, P=0x%lx, R=0x%lx, H=0x%lx\n",
-			(uintptr_t) psxM,
-			(uintptr_t) psxP,
-			(uintptr_t) psxR,
-			(uintptr_t) psxH);
+	// fprintf(stderr, "M=0x%lx, P=0x%lx, R=0x%lx, H=0x%lx\n",
+	// 		(uintptr_t) psxM,
+	// 		(uintptr_t) psxP,
+	// 		(uintptr_t) psxR,
+	// 		(uintptr_t) psxH);
 
 #ifndef _WIN32
 	signal(SIGPIPE, exit);
@@ -405,170 +474,182 @@ static int lightrec_plugin_init(void)
 	return 0;
 }
 
-static u32 hash_calculate_le(const void *buffer, u32 count)
-{
-	unsigned int i;
-	u32 *data = (u32 *) buffer;
-	u32 hash = 0xffffffff;
+static void lightrec_plugin_sync_regs_to_pcsx(bool need_cp2);
+static void lightrec_plugin_sync_regs_from_pcsx(bool need_cp2);
 
-	count /= 4;
-	for(i = 0; i < count; ++i) {
-		hash += LE32TOH(data[i]);
-		hash += (hash << 10);
-		hash ^= (hash >> 6);
+static void lightrec_plugin_execute_internal(bool block_only)
+{
+	struct lightrec_registers *regs;
+	u32 flags, cycles_pcsx;
+
+	regs = lightrec_get_registers(lightrec_state);
+	gen_interupt((psxCP0Regs *)regs->cp0);
+	if (!block_only && stop)
+		return;
+
+	cycles_pcsx = next_interupt - psxRegs.cycle;
+	assert((s32)cycles_pcsx > 0);
+
+	// step during early boot so that 0x80030000 fastboot hack works
+	block_stepping = block_only;
+	if (block_only)
+		cycles_pcsx = 0;
+
+	if (use_pcsx_interpreter) {
+		intExecuteBlock(0);
+	} else {
+		u32 cycles_lightrec = cycles_pcsx * 1024;
+		if (unlikely(use_lightrec_interpreter)) {
+			psxRegs.pc = lightrec_run_interpreter(lightrec_state,
+							      psxRegs.pc,
+							      cycles_lightrec);
+		} else {
+			psxRegs.pc = lightrec_execute(lightrec_state,
+						      psxRegs.pc, cycles_lightrec);
+		}
+
+		lightrec_tansition_to_pcsx(lightrec_state);
+
+		flags = lightrec_exit_flags(lightrec_state);
+
+		if (flags & LIGHTREC_EXIT_SEGFAULT) {
+			fprintf(stderr, "Exiting at cycle 0x%08x\n",
+				psxRegs.cycle);
+			exit(1);
+		}
+
+		if (flags & LIGHTREC_EXIT_SYSCALL)
+			psxException(R3000E_Syscall << 2, 0, (psxCP0Regs *)regs->cp0);
+		if (flags & LIGHTREC_EXIT_BREAK)
+			psxException(R3000E_Bp << 2, 0, (psxCP0Regs *)regs->cp0);
+		else if (flags & LIGHTREC_EXIT_UNKNOWN_OP) {
+			u32 op = intFakeFetch(psxRegs.pc);
+			u32 hlec = op & 0x03ffffff;
+			if ((op >> 26) == 0x3b && hlec < ARRAY_SIZE(psxHLEt) && Config.HLE) {
+				lightrec_plugin_sync_regs_to_pcsx(0);
+				psxHLEt[hlec]();
+				lightrec_plugin_sync_regs_from_pcsx(0);
+			}
+			else
+				psxException(R3000E_RI << 2, 0, (psxCP0Regs *)regs->cp0);
+		}
 	}
 
-	hash += (hash << 3);
-	hash ^= (hash >> 11);
-	hash += (hash << 15);
-	return hash;
-}
-
-static u32 hash_calculate(const void *buffer, u32 count)
-{
-	unsigned int i;
-	u32 *data = (u32 *) buffer;
-	u32 hash = 0xffffffff;
-
-	count /= 4;
-	for(i = 0; i < count; ++i) {
-		hash += data[i];
-		hash += (hash << 10);
-		hash ^= (hash >> 6);
-	}
-
-	hash += (hash << 3);
-	hash ^= (hash >> 11);
-	hash += (hash << 15);
-	return hash;
-}
-
-static const char * const mips_regs[] = {
-	"zero",
-	"at",
-	"v0", "v1",
-	"a0", "a1", "a2", "a3",
-	"t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-	"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-	"t8", "t9",
-	"k0", "k1",
-	"gp", "sp", "fp", "ra",
-	"lo", "hi",
-};
-
-static void print_for_big_ass_debugger(void)
-{
-	unsigned int i;
-
-	printf("CYCLE 0x%08x PC 0x%08x", psxRegs.cycle, psxRegs.pc);
-
-	if (lightrec_very_debug)
-		printf(" RAM 0x%08x SCRATCH 0x%08x HW 0x%08x",
-				hash_calculate_le(psxM, 0x200000),
-				hash_calculate_le(psxH, 0x400),
-				hash_calculate_le(psxH + 0x1000, 0x2000));
-
-	printf(" CP0 0x%08x CP2D 0x%08x CP2C 0x%08x INT 0x%04x INTCYCLE 0x%08x GPU 0x%08x",
-			hash_calculate(&psxRegs.CP0.r,
-				sizeof(psxRegs.CP0.r)),
-			hash_calculate(&psxRegs.CP2D.r,
-				sizeof(psxRegs.CP2D.r)),
-			hash_calculate(&psxRegs.CP2C.r,
-				sizeof(psxRegs.CP2C.r)),
-			psxRegs.interrupt,
-			hash_calculate(psxRegs.intCycle,
-				sizeof(psxRegs.intCycle)),
-			LE32TOH(HW_GPU_STATUS));
-
-	if (lightrec_very_debug)
-		for (i = 0; i < 34; i++)
-			printf(" %s 0x%08x", mips_regs[i], psxRegs.GPR.r[i]);
-	else
-		printf(" GPR 0x%08x", hash_calculate(&psxRegs.GPR.r,
-					sizeof(psxRegs.GPR.r)));
-	printf("\n");
-}
-
-static u32 old_cycle_counter;
-
-static void lightrec_plugin_execute_block(void)
-{
-	u32 old_pc = psxRegs.pc;
-	u32 flags;
-
-	lightrec_reset_cycle_count(lightrec_state, psxRegs.cycle);
-	lightrec_restore_registers(lightrec_state, psxRegs.GPR.r);
-
-	if (use_lightrec_interpreter)
-		psxRegs.pc = lightrec_run_interpreter(lightrec_state, psxRegs.pc);
-	else
-		psxRegs.pc = lightrec_execute_one(lightrec_state, psxRegs.pc);
-
-	psxRegs.cycle = lightrec_current_cycle_count(lightrec_state);
-
-	lightrec_dump_registers(lightrec_state, psxRegs.GPR.r);
-	flags = lightrec_exit_flags(lightrec_state);
-
-	if (flags & LIGHTREC_EXIT_SEGFAULT) {
-		fprintf(stderr, "Exiting at cycle 0x%08x\n",
-			psxRegs.cycle);
-		exit(1);
-	}
-
-	if (flags & LIGHTREC_EXIT_SYSCALL)
-		psxException(0x20, 0);
-
-	psxBranchTest();
-
-	if (lightrec_debug && psxRegs.cycle >= lightrec_begin_cycles
-			&& psxRegs.pc != old_pc)
-		print_for_big_ass_debugger();
-
-	if ((psxRegs.CP0.n.Cause & psxRegs.CP0.n.Status & 0x300) &&
-			(psxRegs.CP0.n.Status & 0x1)) {
+	if ((regs->cp0[13] & regs->cp0[12] & 0x300) && (regs->cp0[12] & 0x1)) {
 		/* Handle software interrupts */
-		psxRegs.CP0.n.Cause &= ~0x7c;
-		psxException(psxRegs.CP0.n.Cause, 0);
-	}
-
-	if ((psxRegs.cycle & ~0xfffffff) != old_cycle_counter) {
-		printf("RAM usage: IR %u KiB, CODE %u KiB, "
-		       "MIPS %u KiB, TOTAL %u KiB, avg. IPI %f\n",
-		       lightrec_get_mem_usage(MEM_FOR_IR) / 1024,
-		       lightrec_get_mem_usage(MEM_FOR_CODE) / 1024,
-		       lightrec_get_mem_usage(MEM_FOR_MIPS_CODE) / 1024,
-		       lightrec_get_total_mem_usage() / 1024,
-		       lightrec_get_average_ipi());
-		old_cycle_counter = psxRegs.cycle & ~0xfffffff;
+		regs->cp0[13] &= ~0x7c;
+		psxException(regs->cp0[13], 0, (psxCP0Regs *)regs->cp0);
 	}
 }
 
 static void lightrec_plugin_execute(void)
 {
-	extern int stop;
-
 	while (!stop)
-		lightrec_plugin_execute_block();
+		lightrec_plugin_execute_internal(false);
+}
+
+static void lightrec_plugin_execute_block(enum blockExecCaller caller)
+{
+	lightrec_plugin_execute_internal(true);
 }
 
 static void lightrec_plugin_clear(u32 addr, u32 size)
 {
-	if (addr == 0 && size == UINT32_MAX)
+	if ((addr == 0 && size == UINT32_MAX)
+	    || (lightrec_hacks & LIGHTREC_OPT_INV_DMA_ONLY))
 		lightrec_invalidate_all(lightrec_state);
 	else
 		/* size * 4: PCSX uses DMA units */
 		lightrec_invalidate(lightrec_state, addr, size * 4);
 }
 
+static void lightrec_plugin_notify(enum R3000Anote note, void *data)
+{
+	switch (note)
+	{
+	case R3000ACPU_NOTIFY_CACHE_ISOLATED:
+	case R3000ACPU_NOTIFY_CACHE_UNISOLATED:
+		/* not used, lightrec calls lightrec_enable_ram() instead */
+		break;
+	case R3000ACPU_NOTIFY_BEFORE_SAVE:
+		/* non-null 'data' means this is HLE related sync */
+		lightrec_plugin_sync_regs_to_pcsx(data == NULL);
+		break;
+	case R3000ACPU_NOTIFY_AFTER_LOAD:
+		lightrec_plugin_sync_regs_from_pcsx(data == NULL);
+		if (data == NULL)
+			lightrec_invalidate_all(lightrec_state);
+		break;
+	}
+}
+
+static void lightrec_plugin_apply_config()
+{
+	static u32 cycles_per_op_old;
+	u32 cycle_mult = Config.cycle_multiplier_override && Config.cycle_multiplier == CYCLE_MULT_DEFAULT
+		? Config.cycle_multiplier_override : Config.cycle_multiplier;
+	u32 cycles_per_op = cycle_mult * 1024 / 100;
+	assert(cycles_per_op);
+
+	if (cycles_per_op_old && cycles_per_op_old != cycles_per_op) {
+		SysPrintf("lightrec: reinit block cache for cycles_per_op %.2f\n",
+			cycles_per_op / 1024.f);
+	}
+	cycles_per_op_old = cycles_per_op;
+	lightrec_set_cycles_per_opcode(lightrec_state, cycles_per_op);
+}
+
 static void lightrec_plugin_shutdown(void)
 {
 	lightrec_destroy(lightrec_state);
+
+	if (!LIGHTREC_CUSTOM_MAP) {
+#if P_HAVE_MMAP
+		munmap(code_buffer, CODE_BUFFER_SIZE);
+#else
+		free(code_buffer);
+#endif
+	}
 }
 
 static void lightrec_plugin_reset(void)
 {
-	lightrec_plugin_shutdown();
-	lightrec_plugin_init();
+	struct lightrec_registers *regs;
+
+	regs = lightrec_get_registers(lightrec_state);
+
+	/* Invalidate all blocks */
+	lightrec_invalidate_all(lightrec_state);
+
+	/* Reset registers */
+	memset(regs, 0, sizeof(*regs));
+
+	regs->cp0[12] = 0x10900000; // COP0 enabled | BEV = 1 | TS = 1
+	regs->cp0[15] = 0x00000002; // PRevID = Revision ID, same as R3000A
+
+	lightrec_set_unsafe_opt_flags(lightrec_state, lightrec_hacks);
+}
+
+static void lightrec_plugin_sync_regs_from_pcsx(bool need_cp2)
+{
+	struct lightrec_registers *regs;
+
+	regs = lightrec_get_registers(lightrec_state);
+	memcpy(regs->gpr, &psxRegs.GPR, sizeof(regs->gpr));
+	memcpy(regs->cp0, &psxRegs.CP0, sizeof(regs->cp0));
+	if (need_cp2)
+		memcpy(regs->cp2d, &psxRegs.CP2, sizeof(regs->cp2d) + sizeof(regs->cp2c));
+}
+
+static void lightrec_plugin_sync_regs_to_pcsx(bool need_cp2)
+{
+	struct lightrec_registers *regs;
+
+	regs = lightrec_get_registers(lightrec_state);
+	memcpy(&psxRegs.GPR, regs->gpr, sizeof(regs->gpr));
+	memcpy(&psxRegs.CP0, regs->cp0, sizeof(regs->cp0));
+	if (need_cp2)
+		memcpy(&psxRegs.CP2, regs->cp2d, sizeof(regs->cp2d) + sizeof(regs->cp2c));
 }
 
 R3000Acpu psxRec =
@@ -578,5 +659,7 @@ R3000Acpu psxRec =
 	lightrec_plugin_execute,
 	lightrec_plugin_execute_block,
 	lightrec_plugin_clear,
+	lightrec_plugin_notify,
+	lightrec_plugin_apply_config,
 	lightrec_plugin_shutdown,
 };
